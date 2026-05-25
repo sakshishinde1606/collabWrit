@@ -1,3 +1,5 @@
+require('dotenv').config();
+
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -6,7 +8,7 @@ const mongoose = require('mongoose');
 const Groq = require('groq-sdk');
 const activeRooms = {};
 // 2. Initialize with your API Key
-const groq = new Groq({ apiKey: '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' });
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
 const app = express();
 app.use(cors());
@@ -55,7 +57,7 @@ app.post('/ai', async (req, res) => {
   }
 });
 // 2. DATABASE CONNECTION
-mongoose.connect('mongodb://127.0.0.1:27017/collab-editor')
+mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log("🏠 Connected to LOCAL MongoDB"))
   .catch(err => console.error("❌ Local DB Connection Error:", err));
 
@@ -266,7 +268,7 @@ const usersInRoom = room ? Array.from(room).map(id => ({
   });
 });
 
-const PORT = 1234;
+const PORT = process.env.PORT || 1234;
 server.listen(PORT, () => {
   console.log(`🚀 Server is running on http://localhost:${PORT}`);
 });
