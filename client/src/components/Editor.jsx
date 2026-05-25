@@ -4,818 +4,451 @@ import io from 'socket.io-client';
 import ReactQuill from 'react-quill-new';
 import 'react-quill-new/dist/quill.snow.css';
 import html2pdf from 'html2pdf.js';
-const socket = io('http://localhost:1234');
-const btnBase = {
-  padding: '8px 14px',
-  borderRadius: '6px',
-  border: '1px solid #e1e4e8',
-  cursor: 'pointer',
-  fontSize: '0.85rem',
-  fontWeight: '500',
-  display: 'flex',
-  alignItems: 'center',
-  gap: '6px',
-  transition: 'all 0.2s'
-};
 
-const primaryBtn = { ...btnBase, backgroundColor: '#6c5ce7', color: 'white', border: 'none' };
-const secondaryBtn = { ...btnBase, backgroundColor: '#fff', color: '#444' };
-const aiBtn = { ...btnBase, backgroundColor: '#f8f7ff', color: '#6c5ce7', borderColor: '#dcd7ff' };
-const dangerBtn = { ...btnBase, backgroundColor: '#fff5f5', color: '#e74c3c', borderColor: '#ffe3e3' };
+const socket = io('http://localhost:1234');
 
 function Editor() {
   const { roomId } = useParams();
   const location = useLocation();
   const myName = location.state?.userName || "Guest";
-  
-  // --- STATE ---
-  const [text, setText] = useState("");
-  const [status, setStatus] = useState("Connecting...");
-  const [isOtherTyping, setIsOtherTyping] = useState(null); // Changed to hold Name
-  const [isListening, setIsListening] = useState(false);
-  const [mediaRecorder, setMediaRecorder] = useState(null);
-  const [activeUsers, setActiveUsers] = useState([]); // Array of names
-  const [notification, setNotification] = useState(""); // For "Joined/Left" popups
-  const [lastSaved, setLastSaved] = useState("Never");
-  const [typingInfo, setTypingInfo] = useState({ name: null, color: '#333' });
-  const typingTimeoutRef = useRef(null);
-  const [cursors, setCursors] = useState({}); // Stores { socketId: { range, userName, userColor } }
-  const quillRef = useRef(null); // IMPORTANT: Add this to your ReactQuill later
   const myPassword = location.state?.password || "";
+
+  const [text, setText] = useState("");
+  const [status, setStatus] = useState("Connecting…");
+  const [activeUsers, setActiveUsers] = useState([]);
+  const [notification, setNotification] = useState(null);
+  const [lastSaved, setLastSaved] = useState(null);
+  const [typingInfo, setTypingInfo] = useState({ name: null, color: '#888' });
+  const [cursors, setCursors] = useState({});
   const [myColor, setMyColor] = useState('#3498db');
   const [aiResult, setAiResult] = useState("");
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
-  const [aiHistory, setAiHistory] = useState([]);
   const [history, setHistory] = useState([]);
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
   const [isShareOpen, setIsShareOpen] = useState(false);
-  const shareUrl = window.location.href; // Gets the current room link
-  // Remove [otherUserId, setOtherUserId] and use this:
-  const [allUsers, setAllUsers] = useState([]); // Array of {userId, userName}
-  const peersRef = useRef({}); // Stores connections: { "socketId": RTCPeerConnection }
-  const localStreamRef = useRef(null);   // --- EFFECT: SOCKETS ---
   const [isDarkMode, setIsDarkMode] = useState(false);
-  const startVoiceRoom = async () => {
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    localStreamRef.current = stream;
-    setNotification("🎙️ You are now speaking to the room!");
+  const [isListening, setIsListening] = useState(false);
+  const [mediaRecorder, setMediaRecorder] = useState(null);
+  const mediaRecorderRef = useRef(null);
+  const [allUsers, setAllUsers] = useState([]);
+  const allUsersRef = useRef([]);
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiHistory, setAiHistory] = useState([]);
 
-    // For every user ALREADY in the room, start a connection
-    allUsers.forEach(async (user) => {
-      if (user.userId === socket.id) return; // Don't call yourself
-      
-      const pc = new RTCPeerConnection({
-        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+  const quillRef = useRef(null);
+  const typingTimeoutRef = useRef(null);
+  const cursorTimeoutRef = useRef(null);
+  const peersRef = useRef({});
+  const localStreamRef = useRef(null);
+
+  const shareUrl = window.location.href;
+  const D = isDarkMode;
+
+  const showNotif = (msg, duration = 3000) => {
+    setNotification(msg);
+    setTimeout(() => setNotification(null), duration);
+  };
+
+  // ── VOICE ROOM ─────────────────────────────────────────────
+  const startVoiceRoom = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      localStreamRef.current = stream;
+      showNotif("🎙 You are now speaking");
+      allUsersRef.current.forEach(async (user) => {
+        if (user.userId === socket.id) return;
+        const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+        pc.onicecandidate = (e) => { if (e.candidate) socket.emit('ice-candidate', { candidate: e.candidate, to: user.userId }); };
+        stream.getTracks().forEach(track => pc.addTrack(track, stream));
+        pc.ontrack = (e) => { const a = new Audio(); a.srcObject = e.streams[0]; a.play(); };
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        socket.emit('call-user', { offer, to: user.userId, from: socket.id });
+        peersRef.current[user.userId] = pc;
       });
-      pc.onicecandidate = (event) => {
-        if (event.candidate) {
-          socket.emit('ice-candidate', { candidate: event.candidate, to: user.userId });
+    } catch (err) { showNotif("Mic error: " + err.message); }
+  };
+
+  // ── SOCKETS ─────────────────────────────────────────────────
+  useEffect(() => {
+    socket.on('all-users-in-room', (users) => { setAllUsers(users); allUsersRef.current = users; });
+
+    socket.on('call-made', async ({ offer, from }) => {
+      const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+      peersRef.current[from] = pc;
+      pc.ontrack = (e) => { const a = new Audio(); a.srcObject = e.streams[0]; a.play(); showNotif("🔊 Listener joined"); };
+      if (localStreamRef.current) localStreamRef.current.getTracks().forEach(t => pc.addTrack(t, localStreamRef.current));
+      await pc.setRemoteDescription(new RTCSessionDescription(offer));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      socket.emit('make-answer', { answer, to: from });
+    });
+
+    socket.on('answer-made', async ({ answer, to }) => {
+      const pc = peersRef.current[to];
+      if (pc) await pc.setRemoteDescription(new RTCSessionDescription(answer));
+    });
+
+    socket.on('ice-candidate', async ({ candidate, from }) => {
+      const tryAdd = async (pc) => {
+        if (pc && pc.remoteDescription) {
+          try { await pc.addIceCandidate(new RTCIceCandidate(candidate)); } catch (e) {}
         }
       };
-      // Add your voice to this connection
-      stream.getTracks().forEach(track => pc.addTrack(track, stream));
-
-      // Listen for their voice coming back
-      pc.ontrack = (event) => {
-        const audio = new Audio();
-        audio.srcObject = event.streams[0];
-        audio.play();
-      };
-
-      // Create the "Offer" for this specific user
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      
-      socket.emit('call-user', { offer, to: user.userId, from: socket.id });
-      
-      // Save this specific connection to our map
-      peersRef.current[user.userId] = pc;
-    });
-  } catch (err) {
-    setNotification("❌ Mic Error: " + err.message);
-  }
-};
-  useEffect(() => {
-    socket.on('all-users-in-room', (users) => {
-    setAllUsers(users);
-  });
-
-  // 2. Handle an incoming call from ANY user
-  socket.on('call-made', async ({ offer, from }) => {
-    const pc = new RTCPeerConnection({
-      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+      if (from && peersRef.current[from]) {
+        tryAdd(peersRef.current[from]);
+      } else {
+        Object.values(peersRef.current).forEach(tryAdd);
+      }
     });
 
-    // Save this connection to our Map
-    peersRef.current[from] = pc;
-
-    // Handle their incoming audio
-    pc.ontrack = (event) => {
-      const audio = new Audio();
-      audio.srcObject = event.streams[0];
-      audio.play();
-      setNotification("🔊 User joined voice!");
-    };
-
-    // If YOU are already speaking, send your audio back to them
-    if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach(track => 
-        pc.addTrack(track, localStreamRef.current)
-      );
-    }
-
-    // Handshake: Set Offer -> Create Answer
-    await pc.setRemoteDescription(new RTCSessionDescription(offer));
-    const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
-
-    socket.emit('make-answer', { answer, to: from });
-  });
-
-  // 3. Handle the Answer coming back to you
-  socket.on('answer-made', async ({ answer, to }) => {
-    const pc = peersRef.current[to];
-    if (pc) {
-      await pc.setRemoteDescription(new RTCSessionDescription(answer));
-    }
-  });
-  socket.on('ice-candidate', async ({ candidate, from }) => {
-  const pc = peersRef.current[from];
-  if (pc) {
-    try {
-      await pc.addIceCandidate(new RTCIceCandidate(candidate));
-    } catch (e) {
-      console.error("Error adding ice candidate", e);
-    }
-  }
-});
     socket.emit('join-room', { roomId, userName: myName, password: myPassword });
-    socket.on('error-msg', (msg) => {
-    alert(msg);
-    window.location.href = "/"; // Send them back to Home
-  });
 
-  socket.on('init-text', ({ content, assignedColor }) => {
-  // 1. Set the document text from the database
-  setText(content);
-  
-  // 2. Update your local state with the color the server picked for you
-  // This ensures your cursor matches your name tag in the header!
-  setMyColor(assignedColor); 
-  
-  // 3. Update the UI status
-  setStatus("Live");
-});
-    // Listen for the updated name list
-    socket.on('update-user-list', (users) => {
-    console.log("👥 Received User List:", users); // Add this log!
-    setActiveUsers(users);
-  });
+    socket.on('error-msg', (msg) => { alert(msg); window.location.href = "/"; });
 
-    // Listen for Joined/Left notifications
-    socket.on('user-notification', (msg) => {
-      setNotification(msg);
-      setTimeout(() => setNotification(""), 3000); // Clear after 3s
+    socket.on('init-text', ({ content, assignedColor, history: h }) => {
+      setText(content);
+      setMyColor(assignedColor);
+      if (h) setHistory(h);
+      setStatus("Live");
     });
-    
-    // Improved typing listener (shows name)
+
+    socket.on('update-user-list', setActiveUsers);
+    socket.on('user-notification', (msg) => showNotif(msg));
     socket.on('user-typing', ({ isTyping, userName, userColor }) => {
-      setTypingInfo(isTyping ? { name: userName, color: userColor } : { name: null, color: '#333' });
+      setTypingInfo(isTyping ? { name: userName, color: userColor } : { name: null, color: '#888' });
     });
-    socket.on('cursor-update', (data) => {
-      setCursors(prev => ({ ...prev, [data.id]: data }));
-    });
-
+    socket.on('cursor-update', (data) => setCursors(prev => ({ ...prev, [data.id]: data })));
     socket.on('text-update', (newHtml) => setText(newHtml));
-
-    socket.on('audio-clip', ({ audioBlob }) => {
-      const audio = new Audio(audioBlob);
-      audio.play().catch(err => console.error("Audio failed", err));
+    socket.on('audio-clip', ({ audioBlob }) => { try { new Audio(audioBlob).play(); } catch {} });
+    socket.on('save-success', ({ timestamp, history: h }) => {
+      setLastSaved(timestamp);
+      if (h) setHistory(h);
+      showNotif("Version saved");
     });
-    socket.on('save-success', ({ timestamp, history: updatedHistory }) => {
-  setLastSaved(timestamp);
-  
-  // 1. Update the local history state so the sidebar shows the new version
-  if (updatedHistory) {
-    setHistory(updatedHistory);
-  }
-  
-  // 2. Clear the "Saving..." notification immediately
-  setNotification("✅ Version Saved!");
-  setTimeout(() => setNotification(""), 2000);
-});
-    // Listen for users leaving to remove their ghost cursors
-socket.on('user-left', (userId) => {
-  setCursors(prev => {
-    const newCursors = { ...prev };
-    delete newCursors[userId];
-    return newCursors;
-  });
-});
-  
-    return () => {
-      socket.off('init-text');
-      socket.off('text-update');
-      socket.off('update-user-list');
-      socket.off('user-notification');
-      socket.off('user-typing');
-      socket.off('audio-clip');
-      socket.off('save-success');
-      socket.off('cursor-update');
-      socket.off('error-msg');
-      socket.off('all-users-in-room');
-      socket.off('call-made');
-      socket.off('answer-made');
+    socket.on('user-left', (userId) => setCursors(prev => { const n = {...prev}; delete n[userId]; return n; }));
 
-      if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach(track => track.stop());
-    }
-      };
+    return () => {
+      ['init-text','text-update','update-user-list','user-notification','user-typing',
+       'audio-clip','save-success','cursor-update','error-msg','all-users-in-room',
+       'call-made','answer-made','ice-candidate','user-left'].forEach(e => socket.off(e));
+      if (localStreamRef.current) localStreamRef.current.getTracks().forEach(t => t.stop());
+    };
   }, [roomId, myName, myPassword]);
 
-  // --- EFFECT: MICROPHONE ---
+  // ── MICROPHONE ───────────────────────────────────────────────
   useEffect(() => {
     if (navigator.mediaDevices?.getUserMedia) {
       navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
-        const recorder = new MediaRecorder(stream);
-        recorder.ondataavailable = (e) => {
+        const rec = new MediaRecorder(stream);
+        rec.ondataavailable = (e) => {
           const reader = new FileReader();
           reader.readAsDataURL(e.data);
-          reader.onloadend = () => {
-            socket.emit('audio-clip', { roomId, audioBlob: reader.result });
-          };
+          reader.onloadend = () => socket.emit('audio-clip', { roomId, audioBlob: reader.result });
         };
-        setMediaRecorder(recorder);
-      });
+        mediaRecorderRef.current = rec;
+        setMediaRecorder(rec);
+      }).catch(() => {});
     }
   }, [roomId]);
 
-  // --- HANDLERS ---
+  // ── HANDLERS ─────────────────────────────────────────────────
   const handleChange = (content, delta, source) => {
     setText(content);
     if (source === 'user') {
-    // 💡 Add 'isManualSave: false' here to prevent auto-versioning
-    socket.emit('text-update', { 
-      roomId, 
-      newText: content, 
-      isManualSave: false 
-    });
-
-    socket.emit('typing', { roomId, isTyping: true });
-    
-    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
-    
-    typingTimeoutRef.current = setTimeout(() => {
-      socket.emit('typing', { roomId, isTyping: false });
-    }, 2000);
-  }
-};
-  const saveDocument = () => {
-  setNotification("💾 Saving milestone version...");
-  socket.emit('text-update', { 
-    roomId, 
-    newText: text, // 'text' is your current state
-    isManualSave: true 
-  });
-};
-  const copyToClipboard = () => {
-    navigator.clipboard.writeText(shareUrl);
-    setNotification("📋 Link copied to clipboard!");
-    setTimeout(() => setNotification(""), 2000);
-  };
-  const toggleListening = () => {
-    const SpeechRecognition = window.webkitSpeechRecognition || window.SpeechRecognition;
-    if (!SpeechRecognition) return alert("Use Chrome!");
-
-    if (isListening) {
-      window.recognitionInstance?.stop();
-      setIsListening(false);
-    } else {
-      const recognition = new SpeechRecognition();
-      window.recognitionInstance = recognition;
-      recognition.lang = 'en-US';
-      recognition.continuous = true;
-      recognition.onstart = () => setIsListening(true);
-      recognition.onresult = (event) => {
-        const transcript = event.results[event.results.length - 1][0].transcript;
-        if (transcript.toLowerCase().includes("clear page")) {
-          setText("");
-          socket.emit('text-update', { roomId, newText: "" });
-        } else {
-          setText(prev => {
-            const updated = prev + " " + transcript;
-            socket.emit('text-update', { roomId, newText: updated });
-            return updated;
-          });
-        }
-      };
-      recognition.onend = () => setIsListening(false);
-      recognition.start();
+      socket.emit('text-update', { roomId, newText: content, isManualSave: false });
+      socket.emit('typing', { roomId, isTyping: true });
+      if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+      typingTimeoutRef.current = setTimeout(() => socket.emit('typing', { roomId, isTyping: false }), 2000);
     }
+  };
+
+  const saveDocument = () => {
+    showNotif("Saving version…");
+    socket.emit('text-update', { roomId, newText: text, isManualSave: true });
+  };
+
+  const handleSelectionChange = (range) => {
+    if (!range) return;
+    if (cursorTimeoutRef.current) clearTimeout(cursorTimeoutRef.current);
+    cursorTimeoutRef.current = setTimeout(() => {
+      socket.emit('cursor-move', { roomId, range, userName: myName, userColor: myColor });
+    }, 50);
+  };
+
+  const toggleListening = () => {
+    const SR = window.webkitSpeechRecognition || window.SpeechRecognition;
+    if (!SR) return alert("Use Chrome for voice input.");
+    if (isListening) { window.recognitionInstance?.stop(); setIsListening(false); return; }
+    const r = new SR();
+    window.recognitionInstance = r;
+    r.lang = 'en-US'; r.continuous = true;
+    r.onstart = () => setIsListening(true);
+    r.onresult = (e) => {
+      const t = e.results[e.results.length - 1][0].transcript;
+      if (t.toLowerCase().includes("clear page")) { setText(""); socket.emit('text-update', { roomId, newText: "" }); }
+      else { setText(prev => { const u = prev + " " + t; socket.emit('text-update', { roomId, newText: u }); return u; }); }
+    };
+    r.onend = () => setIsListening(false);
+    r.start();
   };
 
   const downloadPDF = () => {
-    const element = document.querySelector('.ql-editor');
-    html2pdf().from(element).save(`${roomId}-document.pdf`);
+    const el = document.querySelector('.ql-editor');
+    html2pdf().from(el).save(`${roomId}-document.pdf`);
   };
-  const cursorTimeoutRef = useRef(null); // Add this at the top with your other refs
 
-const handleSelectionChange = (range) => {
-  if (!range) return;
+  const handleAIAction = async (instruction, label) => {
+    setAiLoading(true);
+    setAiResult("");
+    setIsSidebarOpen(true);
+    try {
+      const res = await fetch('http://localhost:1234/ai', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: text.replace(/<[^>]*>/g, ''), instruction })
+      });
+      const data = await res.json();
+      if (data.result) { setAiResult(data.result); setAiHistory(prev => [data.result, ...prev].slice(0, 5)); showNotif(`${label} done`); }
+    } catch { showNotif("AI request failed"); }
+    setAiLoading(false);
+  };
 
-  // Clear the previous timer
-  if (cursorTimeoutRef.current) {
-    clearTimeout(cursorTimeoutRef.current);
-  }
-  
-  // Set a new 50ms "Cooldown"
-  cursorTimeoutRef.current = setTimeout(() => {
-    socket.emit('cursor-move', { 
-      roomId, 
-      range, 
-      userName: myName, 
-      // 💡 Suggestion: Use the color assigned to you by the server!
-      userColor: myColor
-    });
-  }, 50); 
-};
-const handleAIAction = async (instruction) => {
-  setNotification("🤖 AI is working...");
-  
-  try {
-    const response = await fetch('http://localhost:1234/ai', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      // We send the current text and the specific instruction
-      body: JSON.stringify({ 
-        text: text.replace(/<[^>]*>/g, ''), // Strip HTML for the AI
-        instruction: instruction 
-      })
-    });
-
-    const data = await response.json();
-
-    if (data.result) {
-      // Option A: Alert the result (Good for summaries)
-      setAiResult(data.result);
-      setAiHistory(prev => [data.result, ...prev].slice(0, 5));
-      setIsSidebarOpen(true);
-      setNotification("✅ AI task complete!");
-      setTimeout(() => setNotification(""), 2000);
-      
-      // Option B: Append to the editor (Good for "Continue writing")
-      // setText(prev => prev + `<br><strong>AI:</strong> ${data.result}`);
-    }
-  } catch (err) {
-    setNotification("❌ AI Error");
-    console.error(err);
-  }
-};
-  return (
-  <div style={{ 
-    padding: '20px 15px', // Reduced padding for mobile
-    maxWidth: '1000px', 
-    margin: '0 auto', 
-    position: 'relative',
-    minHeight: '100vh',
-    display: 'flex',
-    flexDirection: 'column',
-    backgroundColor: isDarkMode ? '#1a1a2e' : '#f8f9fa', 
-    color: isDarkMode ? '#e0e0e0' : '#333',
-    transition: 'all 0.3s ease'
-  }}>
-    
-    {/* 🔔 Floating Notification Toast */}
-    {notification && (
-      <div style={{
-        position: 'fixed', top: '20px', right: '20px', backgroundColor: '#333',
-        color: 'white', padding: '10px 20px', borderRadius: '8px', zIndex: 1000,
-        boxShadow: '0 4px 12px rgba(0,0,0,0.2)', animation: 'fadeIn 0.3s'
-      }}>
-        {notification}
-      </div>
-    )}
-
-    <header style={{ 
-      display: 'flex', 
-      justifyContent: 'space-between', 
-      alignItems: 'flex-start', 
-      marginBottom: '20px',
-      flexWrap: 'wrap', // 👈 Crucial: Wraps buttons to next line on small screens
-      gap: '15px' 
-    }}>
-      <div style={{ flex: '1 1 300px' }}>
-        <h2 style={{ margin: 0, color: isDarkMode ? '#00cec9' : '#2d3436' }}>📄 {roomId}</h2>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginTop: '5px', flexWrap: 'wrap' }}>
-          <span style={{ color: '#2ecc71', fontSize: '0.85rem', fontWeight: 'bold' }}>● {status}</span>
-          <span style={{ color: '#95a5a6', fontSize: '0.85rem' }}>| Saved: {lastSaved}</span>
-        </div>
-        
-        <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '12px' }}>
-  {activeUsers.map((user) => (
-    <div 
-      key={user.userId} 
-      style={{
-        backgroundColor: user.color || '#00cec9', // Professional teal fallback
-        padding: '6px 14px',
-        borderRadius: '25px',
-        color: 'white',
-        fontSize: '0.8rem',
-        fontWeight: '500',
-        display: 'flex',
-        alignItems: 'center',
-        gap: '8px',
-        boxShadow: '0 2px 5px rgba(0,0,0,0.1)' // Adds a subtle "modern" lift
-      }}
-    >
-      {/* Small "Online" indicator dot */}
-      <span style={{ 
-        width: '6px', 
-        height: '6px', 
-        borderRadius: '50%', 
-        backgroundColor: '#55efc4' 
-      }}></span>
-
-      {user.userName} {user.userId === socket.id ? '(You)' : ''}
-    </div>
-  ))}
-</div>
-      </div>
-
-      <div style={{ display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap' }}>
-        <button 
-    onClick={() => handleAIAction("Summarize this text in 3 short bullet points.")} 
-    style={aiBtnStyle}
-  >
-    📝 Summarize
-  </button>
-
-  {/* Improve Writing Button */}
-  <button 
-    onClick={() => handleAIAction("Fix the grammar and make the tone more professional.")} 
-    style={aiBtnStyle}
-  >
-    ✨ Improve
-  </button>
-
-  {/* Generate Q&A Button (Great for your student profile!) */}
-  <button 
-    onClick={() => handleAIAction("Generate 3 study questions based on this text.")} 
-    style={aiBtnStyle}
-  >
-    ❓ Quiz Me
-  </button>
-  <button 
-  onClick={() => setIsHistoryOpen(true)} 
-  style={{ ...secondaryBtnStyle, backgroundColor: '#f0f2f5' }}
->
-  🕒 History
-</button>
-
-  <button 
-  onClick={saveDocument} 
-  style={{ 
-    ...secondaryBtnStyle, 
-    backgroundColor: '#6c5ce7', 
-    color: 'white',
-    border: 'none' 
-  }}
->
-  💾 Save Version
-</button>
-
-        <button onClick={toggleListening} title="Voice to Text" style={{ border: 'none', background: 'none', fontSize: '1.5rem', cursor: 'pointer' }}>
-          {isListening ? '🛑' : '🎤'}
-        </button>
-
-        <button onMouseDown={() => mediaRecorder?.start()} onMouseUp={() => mediaRecorder?.stop()} style={{ padding: '10px', borderRadius: '8px', cursor: 'pointer', border: '1px solid #ddd', backgroundColor: '#fff' }}>
-          📻 Talk
-        </button>
-        <button onClick={downloadPDF} style={{ padding: '10px', borderRadius: '8px', cursor: 'pointer', border: '1px solid #ddd', backgroundColor: '#fff' }}>📥 PDF</button>
-        <button 
-          onClick={() => { socket.disconnect(); window.location.href = '/'; }}
-          style={{ 
-              padding: '10px 18px', borderRadius: '8px', border: 'none', 
-              backgroundColor: '#e74c3c', color: 'white', cursor: 'pointer', fontWeight: 'bold' 
-          }}
-        >
-          Exit
-        </button>
-      </div>
-      <button 
-  onClick={() => setIsShareOpen(true)} 
-  style={{ 
-    ...secondaryBtnStyle, 
-    backgroundColor: '#6366f1', 
-    color: 'white', 
-    border: 'none' 
-  }}
->
-  🔗 Share & Publish
-</button>
-<button 
-  onClick={() => setIsDarkMode(!isDarkMode)} 
-  style={secondaryBtn} // Uses your existing white button style
->
-  {isDarkMode ? "☀️ Light Mode" : "🌙 Dark Mode"}
-</button>
-{/* ✅ Update this to call startVoiceRoom */}
-<button 
-  onClick={startVoiceRoom} 
-  style={{ 
-    ...secondaryBtnStyle, 
-    backgroundColor: '#00cec9', 
-    color: 'white', 
-    border: 'none' 
-  }}
->
-  🎙️ Join Voice Room
-</button>
-    </header>
-    {/* 🚀 PASTE THE DEBUG BAR HERE (Between Header and Typing Info) */}
-    <div style={{ height: '30px', marginBottom: '10px' }}>
-      {typingInfo.name && (
-        <p style={{ margin: 0, fontSize: '0.85rem', color: typingInfo.color, fontWeight: '600' }}>
-          ✍️ {typingInfo.name} is typing...
-        </p>
-      )}
-    </div>
-
-    <div style={{ 
-      position: 'relative', 
-      marginTop: '10px',
-      flex: 1, // 👈 Makes editor take up remaining vertical space
-      backgroundColor: isDarkMode ? '#16213e' : '#fff',
-        borderLeft: typingInfo.name ? `5px solid ${typingInfo.color}` : (isDarkMode ? '5px solid #0f3460' : '5px solid #eee'),
-        borderRadius: '8px',
-        transition: 'all 0.3s ease' 
-    }}>
-      
-      {Object.values(cursors).map((cursor) => {
-        if (!cursor.range || !quillRef.current || cursor.id === socket.id) return null;
-        const editor = quillRef.current.getEditor();
-        const bounds = editor.getBounds(cursor.range.index);
-        if (!bounds) return null;
-
-        return (
-          <div
-            key={cursor.id}
-            style={{
-              position: 'absolute',
-              left: bounds.left,
-              top: bounds.top + 42, 
-              height: bounds.height,
-              width: '2px',
-              backgroundColor: cursor.userColor,
-              zIndex: 50,
-              pointerEvents: 'none',
-              transition: 'all 0.1s ease'
-            }}
-          >
-            <div style={{
-              position: 'absolute', top: '-20px', left: '0', backgroundColor: cursor.userColor,
-              color: 'white', fontSize: '10px', padding: '2px 6px', borderRadius: '3px',
-              whiteSpace: 'nowrap', fontWeight: 'bold'
-            }}>
-              {cursor.userName}
-            </div>
-          </div>
-        );
-      })}
-
-      <ReactQuill 
-        ref={quillRef}
-        theme="snow" 
-        value={text} 
-        onChange={handleChange} 
-        onChangeSelection={handleSelectionChange} 
-        style={{ height: '70vh' }} // 👈 Changed from 500px to 70% of viewport height
-      />
-    </div>
-    {/* 🤖 AI Sidebar */}
-<div style={{
-  position: 'fixed', top: 0, right: isSidebarOpen ? 0 : '-350px',
-  width: '320px', height: '100vh', backgroundColor: isDarkMode ? '#16213e' : '#fff',color: isDarkMode ? '#fff' : '#444',
-borderLeft: isDarkMode ? '1px solid #0f3460' : 'none',
-  boxShadow: '-4px 0 15px rgba(0,0,0,0.1)', transition: 'right 0.3s ease',
-  zIndex: 1001, padding: '20px', 
-  display: 'flex', flexDirection: 'column' // 👈 This is key
-}}>
-  
-  {/* 1. Sidebar Header */}
-  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexShrink: 0 }}>
-    <h3 style={{ margin: 0, color: '#6c5ce7' }}>🤖 AI Assistant</h3>
-    <button onClick={() => setIsSidebarOpen(false)} style={{ border: 'none', background: 'none', cursor: 'pointer', fontSize: '1.2rem' }}>✖</button>
-  </div>
-  
-  <hr style={{ margin: '15px 0', border: '0.5px solid #eee', flexShrink: 0 }} />
-
-  {/* 2. Scrollable Content Area */}
-  <div style={{ 
-    flex: 1,           // 👈 Takes up all space except the header and button
-    overflowY: 'auto', // 👈 Enables scrolling inside the sidebar
-    fontSize: '0.95rem', 
-    lineHeight: '1.6', 
-    color: '#444', 
-    whiteSpace: 'pre-wrap',
-    paddingRight: '5px' 
-  }}>
-    {aiResult || "Waiting for AI..."}
-  </div>
-
-  {/* 3. Fixed Action Button Area */}
-  <div style={{ padding: '15px 0 5px 0', borderTop: '1px solid #eee', marginTop: '10px', flexShrink: 0 }}>
-    <button 
-      onClick={() => {
-        const editor = quillRef.current.getEditor();
+  const insertAiResult = () => {
+    const editor = quillRef.current?.getEditor();
+    if (!editor) return;
     const range = editor.getSelection();
-    
     if (range) {
-      // 1. Insert the AI text at the current cursor position
       editor.insertText(range.index, `\n-- AI Suggestion --\n${aiResult}\n`);
-      
-      // 2. Move the cursor to the end of the new text
-      editor.setSelection(range.index + aiResult.length + 22); 
+      editor.setSelection(range.index + aiResult.length + 22);
     } else {
-      // Fallback: Append to end if no cursor is active
       setText(prev => prev + `<br><strong>AI:</strong> ${aiResult}`);
     }
-    
     setIsSidebarOpen(false);
-    setNotification("📥 Inserted at cursor!");
-    setTimeout(() => setNotification(""), 2000);
-  }}
-      style={{ 
-        width: '100%', 
-        padding: '12px', 
-        backgroundColor: '#6c5ce7', 
-        color: 'white', 
-        border: 'none', 
-        borderRadius: '8px', 
-        cursor: 'pointer', 
-        fontWeight: 'bold',
-        boxShadow: '0 4px 6px rgba(108, 92, 231, 0.2)'
-      }}
-    >
-      📥 Insert into Editor
-    </button>
-  </div>
-</div>
-{/* 🕒 Version History Sidebar */}
-<div style={{
-  position: 'fixed', top: 0, left: isHistoryOpen ? 0 : '-350px', // Slides from LEFT
-  width: '300px', height: '100vh',backgroundColor: isDarkMode ? '#16213e' : '#fff',
-color: isDarkMode ? '#fff' : '#333',
-borderRight: isDarkMode ? '1px solid #0f3460' : 'none',
-  boxShadow: '4px 0 15px rgba(0,0,0,0.1)', transition: 'left 0.3s ease',
-  zIndex: 1002, padding: '20px', display: 'flex', flexDirection: 'column'
-}}>
-  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-    <h3 style={{ margin: 0 }}>🕒 Version History</h3>
-    <button onClick={() => setIsHistoryOpen(false)} style={{ border: 'none', background: 'none', cursor: 'pointer' }}>✖</button>
-  </div>
-  <p style={{ fontSize: '0.8rem', color: '#888' }}>Click a version to restore it.</p>
-  <hr />
-  
-  <div style={{ flex: 1, overflowY: 'auto' }}>
-    {history.map((ver, i) => (
-      <div 
-        key={i} 
-        onClick={() => {
-          setText(ver.content);
-          socket.emit('text-update', { roomId, newText: ver.content });
-          setIsHistoryOpen(false);
-        }}
-        style={{
-          padding: '12px', borderBottom: '1px solid #eee', cursor: 'pointer',
-          borderRadius: '5px', transition: 'background 0.2s'
-        }}
-        onMouseOver={(e) => e.currentTarget.style.backgroundColor = '#f8f9fa'}
-        onMouseOut={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
-      >
-        <div style={{ fontWeight: 'bold', fontSize: '0.9rem' }}>{ver.timestamp}</div>
-        <div style={{ fontSize: '0.75rem', color: '#666' }}>Saved by {ver.savedBy}</div>
-      </div>
-    ))}
-  </div>
-</div>
-{isShareOpen && (
-  <div style={{
-    position: 'fixed', top: 0, left: 0, width: '100%', height: '100%',
-    backgroundColor: 'rgba(0,0,0,0.5)', display: 'flex', justifyContent: 'center',
-    alignItems: 'center', zIndex: 2000
-  }}>
-    <div style={{
-      backgroundColor: 'white', padding: '30px', borderRadius: '15px',
-      textAlign: 'center', boxShadow: '0 10px 25px rgba(0,0,0,0.2)', maxWidth: '380px', width: '90%'
-    }}>
-      <h3 style={{ marginTop: 0, color: '#2d3436' }}>Invite & Publish</h3>
-      
-      {/* --- COLLABORATION SECTION --- */}
-      <div style={{ marginBottom: '20px' }}>
-        <p style={{ fontSize: '0.85rem', color: '#64748b', fontWeight: '600', textAlign: 'left', marginBottom: '8px' }}>🤝 Collaborate</p>
-        <div style={{ margin: '10px auto', padding: '15px', background: 'white', display: 'inline-block', borderRadius: '10px', border: '1px solid #eee' }}>
-          <img 
-            src={`https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${encodeURIComponent(shareUrl)}`} 
-            alt="QR Code"
-            style={{ display: 'block' }}
-          />
-        </div>
-        <button onClick={copyToClipboard} style={{ ...secondaryBtnStyle, width: '100%', justifyContent: 'center', marginTop: '10px' }}>
-          Copy Invite Link
-        </button>
-      </div>
+    showNotif("Inserted at cursor");
+  };
 
-      {/* --- PUBLIC VIEW SECTION --- */}
-      <div style={{ padding: '15px', backgroundColor: '#f8fafc', borderRadius: '10px', border: '1px solid #e2e8f0', textAlign: 'left' }}>
-        <p style={{ margin: '0 0 5px 0', fontSize: '0.8rem', fontWeight: 'bold', color: '#6366f1' }}>🌐 Public Webpage</p>
-        <p style={{ margin: '0 0 10px 0', fontSize: '0.7rem', color: '#64748b' }}>Anyone with this link can read this document.</p>
-        
-        <div style={{ display: 'flex', gap: '5px' }}>
-          <input 
-            readOnly 
-            value={window.location.origin + "/view/" + roomId} 
-            style={{ flex: 1, padding: '8px', fontSize: '0.75rem', borderRadius: '5px', border: '1px solid #ddd', backgroundColor: '#fff' }}
-          />
-          <button 
-            onClick={() => {
-              navigator.clipboard.writeText(window.location.origin + "/view/" + roomId);
-              setNotification("🚀 Public link copied!");
+  // ── COLORS ───────────────────────────────────────────────────
+  const bg     = D ? '#16191f' : '#f5f2ec';
+  const surface= D ? '#1e2228' : '#ffffff';
+  const border = D ? '#2a2e38' : '#ddd9d1';
+  const txt    = D ? '#e8e3d8' : '#1a1814';
+  const muted  = D ? '#7a7566' : '#9a8f80';
+  const accent = D ? '#c9b99a' : '#1a1814';
+
+  return (
+    <div style={{ minHeight: '100vh', background: bg, fontFamily: "'DM Sans', sans-serif", color: txt, transition: 'background 0.2s, color 0.2s' }}>
+
+      {/* Google Fonts */}
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Sans:wght@300;400;500&display=swap');
+        .cwe-quill .ql-toolbar { background: ${D ? '#1e2228' : '#faf9f6'} !important; border-color: ${border} !important; border-bottom-color: ${border} !important; }
+        .cwe-quill .ql-container { background: ${surface} !important; border-color: ${border} !important; font-family: 'DM Sans', sans-serif !important; color: ${txt} !important; font-size: 1rem !important; }
+        .cwe-quill .ql-editor { min-height: calc(100vh - 220px); line-height: 1.75; padding: 28px 32px; }
+        .cwe-quill .ql-stroke { stroke: ${D ? '#c9b99a' : '#4a4540'} !important; }
+        .cwe-quill .ql-fill { fill: ${D ? '#c9b99a' : '#4a4540'} !important; }
+        .cwe-quill .ql-picker { color: ${D ? '#c9b99a' : '#4a4540'} !important; }
+        .cwe-quill .ql-picker-options { background: ${surface} !important; border-color: ${border} !important; }
+        .cwe-notif { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: ${D ? '#2a2e38' : '#1a1814'}; color: ${D ? '#e8e3d8' : '#f5f2ec'}; padding: 10px 22px; border-radius: 3px; font-size: 0.82rem; font-weight: 500; z-index: 9999; white-space: nowrap; animation: cwe-fadein 0.2s; pointer-events: none; letter-spacing: 0.02em; }
+        @keyframes cwe-fadein { from { opacity: 0; transform: translateX(-50%) translateY(8px); } to { opacity: 1; transform: translateX(-50%) translateY(0); } }
+        .cwe-btn { display: inline-flex; align-items: center; gap: 6px; padding: 7px 13px; border-radius: 3px; border: 1px solid ${border}; background: ${surface}; color: ${txt}; font-family: 'DM Sans', sans-serif; font-size: 0.8rem; font-weight: 500; cursor: pointer; transition: background 0.15s, border-color 0.15s; white-space: nowrap; }
+        .cwe-btn:hover { background: ${D ? '#252a34' : '#f0ece4'}; border-color: ${D ? '#3a3f4d' : '#c5bfb5'}; }
+        .cwe-btn.primary { background: ${D ? '#c9b99a' : '#1a1814'}; color: ${D ? '#16191f' : '#f5f2ec'}; border-color: transparent; }
+        .cwe-btn.primary:hover { background: ${D ? '#d8cbaf' : '#2e2b24'}; }
+        .cwe-btn.danger { border-color: #c0392b; color: #c0392b; }
+        .cwe-btn.danger:hover { background: #fff5f5; }
+        .cwe-btn.ai { border-color: ${D ? '#3a4a5a' : '#cce0f5'}; background: ${D ? '#1e2a38' : '#f0f7ff'}; color: ${D ? '#88b8e0' : '#1a4a7a'}; }
+        .cwe-btn.ai:hover { background: ${D ? '#253344' : '#e3effe'}; }
+        .cwe-sidebar { position: fixed; top: 0; width: 320px; height: 100vh; background: ${surface}; border: 1px solid ${border}; z-index: 500; transition: transform 0.28s ease; display: flex; flex-direction: column; }
+        .cwe-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.35); z-index: 499; animation: cwe-fadein 0.15s; }
+        .cwe-modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,0.45); z-index: 600; display: flex; align-items: center; justify-content: center; padding: 20px; animation: cwe-fadein 0.15s; }
+        .cwe-modal { background: ${surface}; border: 1px solid ${border}; border-radius: 4px; padding: 32px; max-width: 400px; width: 100%; }
+        .cwe-input { width: 100%; padding: 9px 12px; background: ${D ? '#16191f' : '#faf9f6'}; border: 1px solid ${border}; border-radius: 3px; font-family: 'DM Sans', sans-serif; font-size: 0.85rem; color: ${txt}; outline: none; }
+        .cwe-input:focus { border-color: ${D ? '#c9b99a' : '#1a1814'}; }
+        .cwe-tag { display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px; border-radius: 20px; font-size: 0.76rem; font-weight: 500; }
+        .cwe-ver-item { padding: 12px 16px; border-bottom: 1px solid ${border}; cursor: pointer; transition: background 0.15s; }
+        .cwe-ver-item:hover { background: ${D ? '#252a34' : '#faf9f6'}; }
+      `}</style>
+
+      {/* ── NOTIFICATION ─────────────────────────────────────── */}
+      {notification && <div className="cwe-notif">{notification}</div>}
+
+      {/* ── TOPBAR ───────────────────────────────────────────── */}
+      <div style={{ background: D ? '#1e2228' : '#ffffff', borderBottom: `1px solid ${border}`, padding: '0 24px', height: 54, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, position: 'sticky', top: 0, zIndex: 100 }}>
+
+        {/* Left: wordmark + doc title */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 16, minWidth: 0 }}>
+          <span style={{ fontFamily: "'DM Serif Display', serif", fontSize: '1.05rem', color: txt, whiteSpace: 'nowrap', letterSpacing: '-0.01em' }}>CollabWrite</span>
+          <span style={{ color: border, fontSize: '0.9rem' }}>/</span>
+          <span style={{ fontSize: '0.85rem', color: txt, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 200 }}>{roomId}</span>
+          <span style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: '0.72rem', color: status === 'Live' ? '#2ecc71' : muted, fontWeight: 500 }}>
+            {status === 'Live' && <span style={{ width: 5, height: 5, borderRadius: '50%', background: '#2ecc71', display: 'inline-block' }}></span>}
+            {status}
+          </span>
+        </div>
+
+        {/* Right: action buttons */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+          <button className="cwe-btn ai" onClick={() => handleAIAction("Summarize this text in 3 short bullet points.", "Summary")}>Summarize</button>
+          <button className="cwe-btn ai" onClick={() => handleAIAction("Fix the grammar and make the tone more professional.", "Improve")}>Improve</button>
+          <button className="cwe-btn ai" onClick={() => handleAIAction("Generate 3 study questions based on this text.", "Quiz")}>Quiz me</button>
+          <div style={{ width: 1, height: 20, background: border, margin: '0 4px' }}></div>
+          <button className="cwe-btn" onClick={() => setIsHistoryOpen(true)}>History</button>
+          <button className="cwe-btn primary" onClick={saveDocument}>Save</button>
+          <button className="cwe-btn" onClick={() => setIsShareOpen(true)}>Share</button>
+          <div style={{ width: 1, height: 20, background: border, margin: '0 4px' }}></div>
+          <button className="cwe-btn" onClick={toggleListening} title="Voice to text">{isListening ? '⏹ Stop' : '🎤 Voice'}</button>
+          <button
+            className="cwe-btn"
+            onMouseDown={() => {
+              const rec = mediaRecorderRef.current;
+              if (rec && rec.state === 'inactive') rec.start();
             }}
-            style={{ padding: '8px 12px', backgroundColor: '#6366f1', color: 'white', border: 'none', borderRadius: '5px', cursor: 'pointer', fontSize: '0.75rem' }}
-          >
-            Copy
-          </button>
+            onMouseUp={() => {
+              const rec = mediaRecorderRef.current;
+              if (rec && rec.state === 'recording') rec.stop();
+            }}
+            title="Push-to-talk (hold)"
+          >Talk</button>
+          <button className="cwe-btn" onClick={startVoiceRoom} title="Live voice room">Voice room</button>
+          <button className="cwe-btn" onClick={downloadPDF}>PDF</button>
+          <button className="cwe-btn" onClick={() => setIsDarkMode(!D)}>{D ? '☀' : '◑'}</button>
+          <button className="cwe-btn danger" onClick={() => { socket.disconnect(); window.location.href = '/'; }}>Exit</button>
         </div>
       </div>
 
-      {/* --- CLOSE BUTTON (Inside the modal) --- */}
-      <button 
-        onClick={() => setIsShareOpen(false)} 
-        style={{ 
-          marginTop: '20px', width: '100%', padding: '10px', 
-          backgroundColor: '#f1f2f6', border: 'none', borderRadius: '8px', 
-          cursor: 'pointer', fontWeight: 'bold', color: '#2d3436' 
-        }}
-      >
-        Close
-      </button>
+      {/* ── PRESENCE BAR ─────────────────────────────────────── */}
+      <div style={{ background: D ? '#1a1e26' : '#faf9f6', borderBottom: `1px solid ${border}`, padding: '8px 24px', display: 'flex', alignItems: 'center', gap: 20, minHeight: 38 }}>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', flex: 1 }}>
+          {activeUsers.map((user) => (
+            <span key={user.userId} className="cwe-tag" style={{ background: user.color + '22', color: user.color }}>
+              <span style={{ width: 5, height: 5, borderRadius: '50%', background: user.color }}></span>
+              {user.userName}{user.userId === socket.id ? ' (you)' : ''}
+            </span>
+          ))}
+        </div>
+        <div style={{ fontSize: '0.75rem', color: muted, flexShrink: 0 }}>
+          {lastSaved ? `Saved ${lastSaved}` : 'Not saved yet'}
+        </div>
+        {typingInfo.name && (
+          <div style={{ fontSize: '0.75rem', color: typingInfo.color, fontWeight: 500, flexShrink: 0 }}>
+            {typingInfo.name} is typing…
+          </div>
+        )}
+      </div>
+
+      {/* ── EDITOR ───────────────────────────────────────────── */}
+      <div style={{ position: 'relative', maxWidth: 860, margin: '0 auto', padding: '24px 24px 40px' }}>
+
+        {/* Remote cursors */}
+        {Object.values(cursors).map((cursor) => {
+          if (!cursor.range || !quillRef.current || cursor.id === socket.id) return null;
+          const editor = quillRef.current.getEditor();
+          const bounds = editor.getBounds(cursor.range.index);
+          if (!bounds) return null;
+          return (
+            <div key={cursor.id} style={{ position: 'absolute', left: bounds.left + 24, top: bounds.top + 90, height: bounds.height, width: 2, background: cursor.userColor, zIndex: 50, pointerEvents: 'none', transition: 'all 0.1s ease' }}>
+              <div style={{ position: 'absolute', top: -20, left: 0, background: cursor.userColor, color: '#fff', fontSize: 10, padding: '2px 6px', borderRadius: '3px 3px 3px 0', whiteSpace: 'nowrap', fontWeight: 500 }}>
+                {cursor.userName}
+              </div>
+            </div>
+          );
+        })}
+
+        <div className="cwe-quill" style={{ borderRadius: 4, overflow: 'hidden', boxShadow: D ? 'none' : '0 1px 4px rgba(0,0,0,0.06)' }}>
+          <ReactQuill
+            ref={quillRef}
+            theme="snow"
+            value={text}
+            onChange={handleChange}
+            onChangeSelection={handleSelectionChange}
+          />
+        </div>
+      </div>
+
+      {/* ── AI SIDEBAR ───────────────────────────────────────── */}
+      {isSidebarOpen && <div className="cwe-overlay" onClick={() => setIsSidebarOpen(false)} />}
+      <div className="cwe-sidebar" style={{ right: 0, transform: isSidebarOpen ? 'translateX(0)' : 'translateX(100%)' }}>
+        <div style={{ padding: '18px 20px', borderBottom: `1px solid ${border}`, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <span style={{ fontFamily: "'DM Serif Display', serif", fontSize: '1.05rem', color: txt }}>AI Assistant</span>
+          <button className="cwe-btn" style={{ padding: '4px 8px', fontSize: 16 }} onClick={() => setIsSidebarOpen(false)}>✕</button>
+        </div>
+        <div style={{ flex: 1, overflowY: 'auto', padding: '20px', fontSize: '0.88rem', lineHeight: 1.7, color: D ? '#c0bab0' : '#4a4540', whiteSpace: 'pre-wrap' }}>
+          {aiLoading ? (
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 16, paddingTop: 40, color: muted }}>
+              <div style={{ width: 24, height: 24, border: `2px solid ${border}`, borderTopColor: accent, borderRadius: '50%', animation: 'cwe-fadein 0.2s' }}></div>
+              <span style={{ fontSize: '0.78rem' }}>Working…</span>
+            </div>
+          ) : aiResult || (
+            <span style={{ color: muted, fontStyle: 'italic' }}>Use the AI buttons in the toolbar to analyse or improve your text.</span>
+          )}
+        </div>
+        {aiResult && !aiLoading && (
+          <div style={{ padding: '14px 16px', borderTop: `1px solid ${border}` }}>
+            <button className="cwe-btn primary" style={{ width: '100%', justifyContent: 'center' }} onClick={insertAiResult}>
+              Insert into document
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* ── HISTORY SIDEBAR ──────────────────────────────────── */}
+      {isHistoryOpen && <div className="cwe-overlay" onClick={() => setIsHistoryOpen(false)} />}
+      <div className="cwe-sidebar" style={{ left: 0, transform: isHistoryOpen ? 'translateX(0)' : 'translateX(-100%)' }}>
+        <div style={{ padding: '18px 20px', borderBottom: `1px solid ${border}`, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <span style={{ fontFamily: "'DM Serif Display', serif", fontSize: '1.05rem', color: txt }}>Version history</span>
+          <button className="cwe-btn" style={{ padding: '4px 8px', fontSize: 16 }} onClick={() => setIsHistoryOpen(false)}>✕</button>
+        </div>
+        <div style={{ padding: '12px 16px', borderBottom: `1px solid ${border}` }}>
+          <p style={{ fontSize: '0.76rem', color: muted, margin: 0 }}>Click a version to restore it. Saves are created manually.</p>
+        </div>
+        <div style={{ flex: 1, overflowY: 'auto' }}>
+          {history.length === 0 ? (
+            <p style={{ padding: '20px 16px', fontSize: '0.82rem', color: muted, fontStyle: 'italic' }}>No saved versions yet. Use "Save" in the toolbar.</p>
+          ) : [...history].reverse().map((ver, i) => (
+            <div key={i} className="cwe-ver-item" onClick={() => { setText(ver.content); socket.emit('text-update', { roomId, newText: ver.content }); setIsHistoryOpen(false); showNotif("Version restored"); }}>
+              <div style={{ fontWeight: 500, fontSize: '0.85rem', color: txt, marginBottom: 3 }}>{ver.timestamp}</div>
+              <div style={{ fontSize: '0.76rem', color: muted }}>Saved by {ver.savedBy}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* ── SHARE MODAL ──────────────────────────────────────── */}
+      {isShareOpen && (
+        <div className="cwe-modal-bg" onClick={() => setIsShareOpen(false)}>
+          <div className="cwe-modal" onClick={(e) => e.stopPropagation()}>
+            <h3 style={{ fontFamily: "'DM Serif Display', serif", fontSize: '1.3rem', color: txt, marginBottom: 6 }}>Share & publish</h3>
+            <p style={{ fontSize: '0.8rem', color: muted, marginBottom: 24 }}>Invite collaborators or share a read-only public link.</p>
+
+            <div style={{ marginBottom: 20 }}>
+              <div style={{ fontSize: '0.72rem', fontWeight: 500, letterSpacing: '0.08em', textTransform: 'uppercase', color: muted, marginBottom: 10 }}>Collaborate</div>
+              <div style={{ textAlign: 'center', marginBottom: 12 }}>
+                <img src={`https://api.qrserver.com/v1/create-qr-code/?size=130x130&data=${encodeURIComponent(shareUrl)}`} alt="QR Code" style={{ display: 'inline-block', border: `1px solid ${border}`, borderRadius: 3, padding: 8, background: '#fff' }} />
+              </div>
+              <button className="cwe-btn" style={{ width: '100%', justifyContent: 'center' }} onClick={() => { navigator.clipboard.writeText(shareUrl); showNotif("Invite link copied"); }}>
+                Copy invite link
+              </button>
+            </div>
+
+            <div style={{ borderTop: `1px solid ${border}`, paddingTop: 18 }}>
+              <div style={{ fontSize: '0.72rem', fontWeight: 500, letterSpacing: '0.08em', textTransform: 'uppercase', color: muted, marginBottom: 8 }}>Public read-only page</div>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <input readOnly className="cwe-input" value={window.location.origin + "/view/" + roomId} style={{ flex: 1 }} />
+                <button className="cwe-btn primary" onClick={() => { navigator.clipboard.writeText(window.location.origin + "/view/" + roomId); showNotif("Public link copied"); }}>
+                  Copy
+                </button>
+              </div>
+            </div>
+
+            <button className="cwe-btn" style={{ width: '100%', justifyContent: 'center', marginTop: 20 }} onClick={() => setIsShareOpen(false)}>
+              Close
+            </button>
+          </div>
+        </div>
+      )}
     </div>
-  </div>
-)}
-</div>
-
-);
+  );
 }
-const aiBtnStyle = {
-  padding: '6px 12px',
-  borderRadius: '6px',
-  cursor: 'pointer',
-  border: '1px solid #6c5ce7',
-  backgroundColor: '#f3f0ff',
-  color: '#6c5ce7',
-  fontSize: '0.75rem',
-  fontWeight: 'bold'
-};
-// Add these below your aiBtnStyle
-const secondaryBtnStyle = {
-  padding: '8px 15px',
-  borderRadius: '8px',
-  border: '1px solid #ddd',
-  backgroundColor: '#ffffff',
-  cursor: 'pointer',
-  fontSize: '0.85rem',
-  fontWeight: '500',
-  display: 'flex',
-  alignItems: 'center',
-  gap: '5px',
-  transition: 'all 0.2s ease'
-};
 
-const exitBtnStyle = {
-  padding: '8px 18px',
-  borderRadius: '8px',
-  border: 'none',
-  backgroundColor: '#ff7675', // A soft red for the exit button
-  color: 'white',
-  cursor: 'pointer',
-  fontWeight: 'bold',
-  fontSize: '0.85rem',
-  transition: 'background 0.2s'
-};
-const darkTheme = {
-  container: {
-    backgroundColor: '#1a1a2e', // Deep Navy/Charcoal
-    color: '#e0e0e0',
-    minHeight: '100vh',
-    transition: 'all 0.3s ease'
-  },
-  editorWrapper: {
-    backgroundColor: '#16213e',
-    borderRadius: '12px',
-    border: '1px solid #0f3460',
-    boxShadow: '0 10px 30px rgba(0,0,0,0.3)'
-  }
-};
 export default Editor;
