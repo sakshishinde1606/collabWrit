@@ -10,6 +10,7 @@ const activeRooms = {};
 // 2. Initialize with your API Key
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
+
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
@@ -77,7 +78,7 @@ const Document = mongoose.model('Document', DocumentSchema);
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: "http://localhost:3000", 
+    origin: process.env.CLIENT_URL, 
     methods: ["GET", "POST"]
   }
 });
@@ -270,5 +271,5 @@ const usersInRoom = room ? Array.from(room).map(id => ({
 
 const PORT = process.env.PORT || 1234;
 server.listen(PORT, () => {
-  console.log(`🚀 Server is running on http://localhost:${PORT}`);
+  console.log(`🚀 Server is running on ${PORT}`);
 });

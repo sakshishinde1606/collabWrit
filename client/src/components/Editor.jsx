@@ -5,7 +5,7 @@ import ReactQuill from 'react-quill-new';
 import 'react-quill-new/dist/quill.snow.css';
 import html2pdf from 'html2pdf.js';
 
-const socket = io('http://localhost:1234');
+const socket = io(process.env.REACT_APP_API_URL);
 
 function Editor() {
   const { roomId } = useParams();
@@ -203,7 +203,7 @@ function Editor() {
     setAiResult("");
     setIsSidebarOpen(true);
     try {
-      const res = await fetch('http://localhost:1234/ai', {
+      const res = await fetch(`${process.env.REACT_APP_API_URL}/ai`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text: text.replace(/<[^>]*>/g, ''), instruction })

@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import io from 'socket.io-client';
 
-const socket = io('http://localhost:1234');
+const socket = io(process.env.REACT_APP_API_URL);
 
 function PublicView() {
   const { roomId } = useParams();
